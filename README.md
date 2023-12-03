@@ -1,2 +1,2 @@
 # SpringTelegramBot
-This is my telegram bot on Java
+This is my telegram bot on Java.

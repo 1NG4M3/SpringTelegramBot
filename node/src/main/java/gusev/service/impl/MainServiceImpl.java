@@ -1,41 +1,48 @@
 package gusev.service.impl;
 
+import lombok.RequiredArgsConstructor;
+import lombok.extern.log4j.Log4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.Update;
 import gusev.dao.AppUserDAO;
 import gusev.dao.RawDataDAO;
 import gusev.entity.AppDocument;
+import gusev.entity.AppPhoto;
 import gusev.entity.AppUser;
 import gusev.entity.RawData;
 import gusev.exceptions.UploadFileException;
+import gusev.service.AppUserService;
 import gusev.service.FileService;
 import gusev.service.MainService;
 import gusev.service.ProducerService;
+import gusev.service.enums.LinkType;
 import gusev.service.enums.ServiceCommand;
-import lombok.extern.log4j.Log4j;
-import org.json.JSONException;
-import org.springframework.stereotype.Service;
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.objects.Update;
-import org.telegram.telegrambots.meta.api.objects.User;
 
 import static gusev.entity.enums.UserState.BASIC_STATE;
 import static gusev.entity.enums.UserState.WAIT_FOR_EMAIL_STATE;
-import static gusev.service.enums.ServiceCommand.*;
+import static gusev.service.enums.ServiceCommand.CANCEL;
+import static gusev.service.enums.ServiceCommand.HELP;
+import static gusev.service.enums.ServiceCommand.REGISTRATION;
+import static gusev.service.enums.ServiceCommand.START;
 
-@Service
 @Log4j
+@RequiredArgsConstructor
+@Service
 public class MainServiceImpl implements MainService {
+
     private final RawDataDAO rawDataDAO;
+
     private final ProducerService producerService;
+
     private final AppUserDAO appUserDAO;
+
     private final FileService fileService;
 
-    public MainServiceImpl(RawDataDAO rawDataDAO, ProducerService producerService, AppUserDAO appUserDAO, FileService fileService) {
-        this.rawDataDAO = rawDataDAO;
-        this.producerService = producerService;
-        this.appUserDAO = appUserDAO;
-        this.fileService = fileService;
-    }
+    private final AppUserService appUserService;
 
+    @Transactional
     @Override
     public void processTextMessage(Update update) {
         saveRawData(update);
@@ -47,10 +54,10 @@ public class MainServiceImpl implements MainService {
         var serviceCommand = ServiceCommand.fromValue(text);
         if (CANCEL.equals(serviceCommand)) {
             output = cancelProcess(appUser);
-        } else if (BASIC_STATE.equals(userState)){
-            output = processServiceCommand(appUser,text);
-        } else if (WAIT_FOR_EMAIL_STATE.equals(userState)){
-            //TODO добавить обработку емейла
+        } else if (BASIC_STATE.equals(userState)) {
+            output = processServiceCommand(appUser, text);
+        } else if (WAIT_FOR_EMAIL_STATE.equals(userState)) {
+            output = appUserService.setEmail(appUser, text);
         } else {
             log.error("Unknown user state: " + userState);
             output = "Неизвестная ошибка! Введите /cancel и попробуйте снова!";
@@ -71,16 +78,17 @@ public class MainServiceImpl implements MainService {
 
         try {
             AppDocument doc = fileService.processDoc(update.getMessage());
-            //TODO Добавить генерацию ссылки для скачивания документа
+            String link = fileService.generateLink(doc.getId(), LinkType.GET_DOC);
             var answer = "Документ успешно загружен! "
-                    + "Ссылка для скачивания: http://test.ru/get-doc/777";
+                    + "Ссылка для скачивания: " + link;
             sendAnswer(answer, chatId);
-        } catch (UploadFileException | JSONException ex) {
+        } catch (UploadFileException ex) {
             log.error(ex);
             String error = "К сожалению, загрузка файла не удалась. Повторите попытку позже.";
             sendAnswer(error, chatId);
         }
     }
+
     @Override
     public void processPhotoMessage(Update update) {
         saveRawData(update);
@@ -89,11 +97,20 @@ public class MainServiceImpl implements MainService {
         if (isNotAllowToSendContent(chatId, appUser)) {
             return;
         }
-        //TODO добавить сохранения фото
-        var answer = "Фото успешно загружено! "
-                + "Ссылка для скачивания: http://test.ru/get-photo/777";
-        sendAnswer(answer, chatId);
+
+        try {
+            AppPhoto photo = fileService.processPhoto(update.getMessage());
+            String link = fileService.generateLink(photo.getId(), LinkType.GET_PHOTO);
+            var answer = "Фото успешно загружено! "
+                    + "Ссылка для скачивания: " + link;
+            sendAnswer(answer, chatId);
+        } catch (UploadFileException ex) {
+            log.error(ex);
+            String error = "К сожалению, загрузка фото не удалась. Повторите попытку позже.";
+            sendAnswer(error, chatId);
+        }
     }
+
     private boolean isNotAllowToSendContent(Long chatId, AppUser appUser) {
         var userState = appUser.getState();
         if (!appUser.getIsActive()) {
@@ -110,7 +127,7 @@ public class MainServiceImpl implements MainService {
     }
 
     private void sendAnswer(String output, Long chatId) {
-        SendMessage sendMessage  = new SendMessage();
+        var sendMessage = new SendMessage();
         sendMessage.setChatId(chatId);
         sendMessage.setText(output);
         producerService.producerAnswer(sendMessage);
@@ -119,8 +136,7 @@ public class MainServiceImpl implements MainService {
     private String processServiceCommand(AppUser appUser, String cmd) {
         var serviceCommand = ServiceCommand.fromValue(cmd);
         if (REGISTRATION.equals(serviceCommand)) {
-            //TODO добавить регистрацию
-            return "Временно недоступно.";
+            return appUserService.registerUser(appUser);
         } else if (HELP.equals(serviceCommand)) {
             return help();
         } else if (START.equals(serviceCommand)) {
@@ -142,26 +158,25 @@ public class MainServiceImpl implements MainService {
         return "Команда отменена!";
     }
 
-    private AppUser findOrSaveAppUser(Update update){
-        User telegramUser = update.getMessage().getFrom();
-        AppUser persistentAppUser = appUserDAO.findAppUserByTelegramUserId(telegramUser.getId());
-        if (persistentAppUser == null) {
+    private AppUser findOrSaveAppUser(Update update) {
+        var telegramUser = update.getMessage().getFrom();
+        var appUserOpt = appUserDAO.findByTelegramUserId(telegramUser.getId());
+        if (appUserOpt.isEmpty()) {
             AppUser transientAppUser = AppUser.builder()
                     .telegramUserId(telegramUser.getId())
                     .username(telegramUser.getUserName())
                     .firstName(telegramUser.getFirstName())
                     .lastName(telegramUser.getLastName())
-                    //TODO изменить значение по умолчанию после добавления регистрации
-                    .isActive(true)
+                    .isActive(false)
                     .state(BASIC_STATE)
                     .build();
             return appUserDAO.save(transientAppUser);
         }
-        return persistentAppUser;
+        return appUserOpt.get();
     }
 
     private void saveRawData(Update update) {
-        RawData rawData = RawData.builder()
+        var rawData = RawData.builder()
                 .event(update)
                 .build();
         rawDataDAO.save(rawData);
